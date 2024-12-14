@@ -169,6 +169,7 @@
 #endif
 
 #if !HASH_ALGO_SUM
+#include "tmpdir.h"
 static void
 output_file (char const *file, int binary_file, void const *digest,
              bool raw, bool tagged, unsigned char delim, bool args,
@@ -220,6 +221,15 @@ static bool raw_digest = false;
 # define BLAKE2B_MAX_LEN BLAKE2B_OUTBYTES
 static uintmax_t digest_length;
 #endif /* HASH_ALGO_BLAKE2 */
+
+#if !HASH_ALGO_SUM
+/* With --check-stream=CHECKSUM, check the FILE with the CHECKSUM.
+   The FILE is copied to the stdout after the check.
+   A temporary file is used as the buffer. */
+static char *check_stream = NULL;
+static int check_stream_tmpfile = -1;
+static char check_stream_tmpfile_name[PATH_MAX];
+#endif /* !HASH_ALGO_SUM */
 
 typedef void (*digest_output_fn)(char const *, int, void const *, bool,
                                  bool, unsigned char, bool, uintmax_t);
@@ -386,6 +396,7 @@ static struct option const long_options[] =
 
 #if !HASH_ALGO_SUM
   { "check", no_argument, nullptr, 'c' },
+  { "check-stream", required_argument, nullptr, 'S' },
   { "ignore-missing", no_argument, nullptr, IGNORE_MISSING_OPTION},
   { "quiet", no_argument, nullptr, QUIET_OPTION },
   { "status", no_argument, nullptr, STATUS_OPTION },
@@ -471,6 +482,9 @@ Print or check %s (%d-bit) checksums.\n\
 # endif
         fputs (_("\
   -c, --check           read checksums from the FILEs and check them\n\
+"), stdout);
+        fputs (_("\
+  -S, --check-stream=CHECKSUM   check the FILE with CHECKSUM and pipe the FILE to stdout\n\
 "), stdout);
 # if HASH_ALGO_BLAKE2 || HASH_ALGO_CKSUM
         fputs (_("\
@@ -1344,6 +1358,70 @@ digest_check (char const *checkfile_name)
           && (!strict || n_misformatted_lines == 0));
 }
 
+#if !HASH_ALGO_SUM
+static void check_stream_tmpfile_atexit (void)
+{
+  if (check_stream_tmpfile >= 0)
+    if (close (check_stream_tmpfile) <  0)
+      error (EXIT_FAILURE, errno, _("%s"),
+          quotef (check_stream_tmpfile_name));
+  if (strlen (check_stream_tmpfile_name) > 0)
+    if (unlink (check_stream_tmpfile_name) <  0)
+      error (EXIT_FAILURE, errno, _("%s"),
+          quotef (check_stream_tmpfile_name));
+}
+
+/* gnulib/lib/copy-file.c does not support FD */
+static void xcopy_fd_to (int src, int dst)
+{
+  /* TODO: use copy_file_range on Linux */
+  /* TODO: use clonefile on Darwin */
+
+  /* 64KiB on 4KiB-page host */
+  int buffer_size = getpagesize () * 16;
+  char *buffer = xmalloc (buffer_size);
+  for (;;)
+    {
+      int n = read (src, buffer, buffer_size);
+      if (n < 0)
+        error (EXIT_FAILURE, errno, _("read"));
+      else if (n == 0)
+        break;
+      else if (write (dst, buffer, n) != n)
+        error (EXIT_FAILURE, errno, _("write"));
+    }
+  free (buffer);
+}
+
+/* prints the digest pair (expected vs actual) on mismatch */
+static bool digest_equal (char const *expected, unsigned char const *bin_buffer)
+  {
+    char *buf;
+    bool ok = false;
+#if HASH_ALGO_CKSUM
+    if (base64_digest)
+      {
+        size_t buf_len = BASE64_LENGTH (DIGEST_BIN_BYTES) + 1;
+        buf = xmalloc (buf_len);
+        base64_encode ((const char *)bin_buffer, digest_length / 8,
+            buf, buf_len);
+        ok = strcmp (expected, buf) == 0;
+      }
+    else
+#endif
+      {
+        buf = xmalloc (digest_hex_bytes + 1);
+        for (size_t i = 0; i < (digest_hex_bytes / 2); ++i)
+          snprintf (buf + i * 2, 3, "%02x", bin_buffer[i]);
+        ok = strcasecmp (expected, buf) == 0;
+      }
+    if (!ok)
+      error (0, 0, _("FAILED: %s vs %s"), expected, buf);
+    free (buf);
+    return ok;
+}
+#endif /* !HASH_ALGO_SUM */
+
 int
 main (int argc, char **argv)
 {
@@ -1372,13 +1450,13 @@ main (int argc, char **argv)
 #if HASH_ALGO_SUM
   char const *short_opts = "rs";
 #elif HASH_ALGO_CKSUM
-  char const *short_opts = "a:l:bctwz";
+  char const *short_opts = "a:l:bcS:twz";
   char const *digest_length_str = "";
 #elif HASH_ALGO_BLAKE2
-  char const *short_opts = "l:bctwz";
+  char const *short_opts = "l:bcS:twz";
   char const *digest_length_str = "";
 #else
-  char const *short_opts = "bctwz";
+  char const *short_opts = "bcS:twz";
 #endif
 
   while ((opt = getopt_long (argc, argv, short_opts, long_options, nullptr))
@@ -1407,6 +1485,18 @@ main (int argc, char **argv)
 #if !HASH_ALGO_SUM
       case 'c':
         do_check = true;
+        break;
+      case 'S':
+        do_check = true;
+        check_stream = optarg;
+        /* temp-stream.h cannot be used, as it unlinks the file immediately */
+        if (path_search (check_stream_tmpfile_name, sizeof check_stream_tmpfile_name,
+              NULL, "tmpf", true) != 0)
+          error (EXIT_FAILURE, errno, _("failed to locate a temporary file directory"));
+        if ((check_stream_tmpfile = mkstemp (check_stream_tmpfile_name)) < 0)
+          error (EXIT_FAILURE, errno, _("failed to create a temporary file"));
+        if (atexit (check_stream_tmpfile_atexit) != 0)
+          error (EXIT_FAILURE, errno, _("atexit"));
         break;
       case STATUS_OPTION:
         status_only = true;
@@ -1525,7 +1615,35 @@ main (int argc, char **argv)
      error (0, 0, _("--base64 and --raw are mutually exclusive"));
      usage (EXIT_FAILURE);
    }
+
+  if (check_stream && raw_digest)
+   {
+     error (0, 0, _("--check-stream and --raw are mutually exclusive"));
+     usage (EXIT_FAILURE);
+   }
 #endif
+
+#if !HASH_ALGO_SUM
+  if (check_stream)
+    {
+      if (DIGEST_OUT != output_file)
+        {
+          error (0, 0, _("--check-stream is not supported with the specified algorithm"));
+          usage (EXIT_FAILURE);
+        }
+      if (ignore_missing)
+        {
+          error (0, 0, _("--check-stream and --ignore-missing are mutually exclusive"));
+          usage (EXIT_FAILURE);
+        }
+      if (status_only)
+        {
+          error (0, 0, _("--check-stream and --status are mutually exclusive"));
+          usage (EXIT_FAILURE);
+        }
+      /* quiet, strict, and warn are no-op */
+    }
+#endif /* !HASH_ALGO_SUM */
 
   if (prefix_tag == -1)
     prefix_tag = HASH_ALGO_CKSUM;
@@ -1609,10 +1727,59 @@ main (int argc, char **argv)
   char **operand_lim = argv + argc;
   if (optind == argc)
     *operand_lim++ = bad_cast ("-");
-  else if (1 < argc - optind && raw_digest)
-    error (EXIT_FAILURE, 0,
-           _("the --raw option is not supported with multiple files"));
+  else if (1 < argc - optind)
+    {
+      if (raw_digest)
+        error (EXIT_FAILURE, 0,
+            _("the --raw option is not supported with multiple files"));
+#if !HASH_ALGO_SUM
+      if (check_stream)
+        error (EXIT_FAILURE, 0,
+            _("the --check-stream option is not supported with multiple files"));
+#endif /* !HASH_ALGO_SUM */
+    }
 
+#if !HASH_ALGO_SUM
+  if (check_stream)
+    {
+      int binary_file = 1;
+      bool missing;
+      uintmax_t length;
+      char *file = *(argv+optind);
+      bool is_stdin = (STREQ (file, "-"));
+      int fd;
+      if (is_stdin)
+        {
+          fd = STDIN_FILENO;
+          have_read_stdin = true;
+        } else
+        {
+          if ((fd = open (file, O_RDONLY | O_BINARY)) < 0)
+            {
+              error (EXIT_FAILURE, errno, "%s", quotef (file));
+            }
+        }
+      /* Copy the input stream to tmpfile */
+      xcopy_fd_to (fd, check_stream_tmpfile);
+      if (!is_stdin)
+        close(fd);
+      /* Check the digest of the tmpfile */
+      if (!digest_file (check_stream_tmpfile_name, &binary_file, bin_buffer, &missing, &length))
+        {
+          ok = false;
+          goto done;
+        }
+      ok = digest_equal (check_stream, bin_buffer);
+      if (!ok)
+        goto done;
+      /* Copy tmpfile to stdout */
+      if (lseek (check_stream_tmpfile, 0, SEEK_SET) < 0)
+        error (EXIT_FAILURE, errno, "%s", quotef (check_stream_tmpfile_name));
+      xcopy_fd_to (check_stream_tmpfile, STDOUT_FILENO);
+      /* check_stream_tmpfile is automatically cleaned up via atexit(3). */
+      goto done;
+    }
+#endif /* !HASH_ALGO_SUM */
   for (char **operandp = argv + optind; operandp < operand_lim; operandp++)
     {
       char *file = *operandp;
@@ -1634,6 +1801,9 @@ main (int argc, char **argv)
         }
     }
 
+#if !HASH_ALGO_SUM
+done:
+#endif /* !HASH_ALGO_SUM */
   if (have_read_stdin && fclose (stdin) == EOF)
     error (EXIT_FAILURE, errno, _("standard input"));
 

@@ -298,6 +298,7 @@ all_tests =					\
   tests/cksum/cksum.sh				\
   tests/cksum/cksum-a.sh			\
   tests/cksum/cksum-c.sh			\
+  tests/cksum/cksum-check-stream.sh		\
   tests/cksum/cksum-base64.pl			\
   tests/cksum/cksum-raw.sh			\
   tests/misc/comm.pl				\
